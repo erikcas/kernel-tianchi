@@ -3091,3 +3091,11 @@ config SIM_DETECT_FEATURE
 	 based on modem hotstwap ISR to work around GPIO 56/60
 	 prevent AP suspend issue.use modem side GPIO detect to SIM insert
 	 or remove, and notify AP to handle reboot
+
+config KERNEL_TEXT_MPU_PROT
+        bool "Enable xpu protection of kernel r/o sections"
+        help
+          Enables xpu protection of kernel code and read-only data
+          sections early in boot. Read access is permitted to
+          all masters; Write access is only permited to the
+          secure world.

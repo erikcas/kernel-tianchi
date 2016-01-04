@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  * Copyright (C) 2014 Sony Mobile Communications Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -24,7 +24,7 @@
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/leds.h>
-#include <linux/pwm.h>
+#include <linux/qpnp/pwm.h>
 #include <linux/err.h>
 #include <linux/gpio.h>
 #include <linux/regulator/consumer.h>
@@ -707,8 +707,7 @@ static int mdss_dsi_parse_dcs_cmds(struct device_node *np,
 		if (dchdr->dlen > len) {
 			pr_err("%s: dtsi cmd=%x error, len=%d",
 				__func__, dchdr->dtype, dchdr->dlen);
-			kfree(buf);
-			return -ENOMEM;
+			goto exit_free;
 		}
 		bp += sizeof(*dchdr);
 		len -= sizeof(*dchdr);
@@ -720,15 +719,13 @@ static int mdss_dsi_parse_dcs_cmds(struct device_node *np,
 	if (len != 0) {
 		pr_err("%s: dcs_cmd=%x len=%d error!",
 				__func__, buf[0], blen);
-		kfree(buf);
-		return -ENOMEM;
+		goto exit_free;
 	}
 
 	pcmds->cmds = kzalloc(cnt * sizeof(struct dsi_cmd_desc),
 						GFP_KERNEL);
 	if (!pcmds->cmds) {
-		kfree(buf);
-		return -ENOMEM;
+		goto exit_free;
 	}
 
 	pcmds->cmd_cnt = cnt;
@@ -751,14 +748,20 @@ static int mdss_dsi_parse_dcs_cmds(struct device_node *np,
 
 	if (link_key != NULL) {
 		data = of_get_property(np, link_key, NULL);
-		if (!strncmp(data, "DSI_HS_MODE", 11))
+		if (data && !strcmp(data, "DSI_HS_MODE"))
 			pcmds->link_state = DSI_HS_MODE;
+		else
+			pcmds->link_state = DSI_LP_MODE;
 	}
 
 	pr_debug("%s: dcs_cmd=%x len=%d, cmd_cnt=%d link_state=%d\n", __func__,
 		pcmds->buf[0], pcmds->blen, pcmds->cmd_cnt, pcmds->link_state);
 
 	return 0;
+
+exit_free:
+	kfree(buf);
+	return -ENOMEM;
 }
 
 int mdss_panel_get_dst_fmt(u32 bpp, char mipi_mode, u32 pixel_packing,
@@ -1169,9 +1172,9 @@ static void mdss_dsi_panel_bklt_pwm(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 	pr_debug("%s: ndx=%d level=%d duty=%d\n", __func__,
 					ctrl->ndx, level, duty);
 
-	ret = pwm_config(ctrl->pwm_bl, duty, ctrl->pwm_period);
+	ret = pwm_config_us(ctrl->pwm_bl, duty, ctrl->pwm_period);
 	if (ret) {
-		pr_err("%s: pwm_config() failed err=%d.\n", __func__, ret);
+		pr_err("%s: pwm_config_us() failed err=%d.\n", __func__, ret);
 		return;
 	}
 
@@ -1204,6 +1207,17 @@ static void mdss_dsi_panel_bklt_dcs(struct mdss_dsi_ctrl_pdata *ctrl, int level)
 	mdss_dsi_cmdlist_put(ctrl, &cmdreq);
 }
 
+static struct mdss_dsi_ctrl_pdata *get_rctrl_data(struct mdss_panel_data *pdata)
+{
+	if (!pdata || !pdata->next) {
+		pr_err("%s: Invalid panel data\n", __func__);
+		return NULL;
+	}
+
+	return container_of(pdata->next, struct mdss_dsi_ctrl_pdata,
+			panel_data);
+}
+
 static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 							u32 bl_level)
 {
@@ -1225,6 +1239,16 @@ static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 		break;
 	case BL_DCS_CMD:
 		mdss_dsi_panel_bklt_dcs(ctrl_pdata, bl_level);
+		if (ctrl_pdata->shared_pdata.broadcast_enable &&
+				ctrl_pdata->ndx == DSI_CTRL_0) {
+			struct mdss_dsi_ctrl_pdata *rctrl_pdata = NULL;
+			rctrl_pdata = get_rctrl_data(pdata);
+			if (!rctrl_pdata) {
+				pr_err("%s: Right ctrl data NULL\n", __func__);
+				return;
+			}
+			mdss_dsi_panel_bklt_dcs(rctrl_pdata, bl_level);
+		}
 		break;
 	default:
 		pr_err("%s: Unknown bl_ctrl configuration\n",
@@ -1524,18 +1548,24 @@ static int mdss_panel_parse_dt(struct device_node *np,
 		pdest = of_get_property(next,
 			"qcom,mdss-dsi-panel-destination", NULL);
 
-		if (strlen(pdest) != 9) {
-			pr_err("%s: Unknown pdest specified\n", __func__);
+		if (pdest) {
+			if (strlen(pdest) != 9) {
+				pr_err("%s: Unknown pdest specified\n",
+					__func__);
+				goto error;
+			}
+			if (!strcmp(pdest, "display_1"))
+				pinfo->pdest = DISPLAY_1;
+			else if (!strcmp(pdest, "display_2"))
+				pinfo->pdest = DISPLAY_2;
+			else {
+				pr_debug("%s: pdest not specified. Set Default\n",
+					__func__);
+				pinfo->pdest = DISPLAY_1;
+			}
+		} else {
+			pr_err("%s: pdest not specified\n", __func__);
 			goto error;
-		}
-		if (!strncmp(pdest, "display_1", 9))
-			pinfo->pdest = DISPLAY_1;
-		else if (!strncmp(pdest, "display_2", 9))
-			pinfo->pdest = DISPLAY_2;
-		else {
-			pr_err("%s: pdest not specified. Set Default\n",
-								__func__);
-			pinfo->pdest = DISPLAY_1;
 		}
 		rc = of_property_read_u32(next,
 			"qcom,mdss-dsi-h-front-porch", &tmp);
@@ -1656,10 +1686,10 @@ static int mdss_panel_parse_dt(struct device_node *np,
 			"qcom,mdss-dsi-te-dcs-command", &tmp);
 		pinfo->mipi.insert_dcs_cmd = (!rc ? tmp : 1);
 		rc = of_property_read_u32(next,
-			"qcom,mdss-dsi-te-v-sync-continue-lines", &tmp);
+			"qcom,mdss-dsi-wr-mem-continue", &tmp);
 		pinfo->mipi.wr_mem_continue = (!rc ? tmp : 0x3c);
 		rc = of_property_read_u32(next,
-			"qcom,mdss-dsi-te-v-sync-rd-ptr-irq-line", &tmp);
+			"qcom,mdss-dsi-wr-mem-start", &tmp);
 		pinfo->mipi.wr_mem_start = (!rc ? tmp : 0x2c);
 		rc = of_property_read_u32(next,
 			"qcom,mdss-dsi-te-pin-select", &tmp);
@@ -1699,6 +1729,11 @@ static int mdss_panel_parse_dt(struct device_node *np,
 		rc = of_property_read_u32(next,
 			"qcom,mdss-dsi-t-clk-post", &tmp);
 		pinfo->mipi.t_clk_post = (!rc ? tmp : 0x03);
+
+		pinfo->mipi.rx_eot_ignore = of_property_read_bool(next,
+			"qcom,mdss-dsi-rx-eot-ignore");
+		pinfo->mipi.tx_eot_append = of_property_read_bool(next,
+			"qcom,mdss-dsi-tx-eot-append");
 
 		rc = of_property_read_u32(next, "qcom,mdss-dsi-stream", &tmp);
 		pinfo->mipi.stream = (!rc ? tmp : 0);
@@ -1740,6 +1775,12 @@ static int mdss_panel_parse_dt(struct device_node *np,
 		for (i = 0; i < len; i++)
 			pinfo->mipi.dsi_phy_db.timing[i] = data[i];
 
+		pinfo->mipi.lp11_init = of_property_read_bool(np,
+						"qcom,mdss-dsi-lp11-init");
+		rc = of_property_read_u32(np, "qcom,mdss-dsi-init-delay-us",
+				&tmp);
+		pinfo->mipi.init_delay = (!rc ? tmp : 0);
+
 		data = of_get_property(next,
 			"qcom,panel-phy-strengthCtrl", &len);
 		if ((data) && (len == 2)) {
@@ -1755,9 +1796,6 @@ static int mdss_panel_parse_dt(struct device_node *np,
 						data[i];
 			}
 		}
-
-		pinfo->mipi.lp11_init = of_property_read_bool(np,
-					"qcom,mdss-dsi-lp11-init");
 
 		rc = of_property_read_u32(next, "somc,disp-en-on-pre", &tmp);
 		spec_pdata->disp_en_pre = !rc ? tmp : 0;
@@ -1998,7 +2036,7 @@ error_attr:
 	return rc;
 }
 
-void mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
+int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 {
-	mdss_dsi_panel_reset_panel(pdata, enable);
+	return mdss_dsi_panel_reset_panel(pdata, enable);
 }
